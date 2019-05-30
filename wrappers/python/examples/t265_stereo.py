@@ -288,7 +288,7 @@ try:
 
                 assert(depth.shape == gray.shape)
 
-                oin = o3d.camera.PinholeCameraIntrinsic(depth.shape[0],depth.shape[1],stereo_focal_px,stereo_focal_px,depth.shape[0]/2,depth.shape[1]/2)
+                oin = o3d.camera.PinholeCameraIntrinsic(width=depth.shape[0], height=depth.shape[1], fx=stereo_focal_px, fy=stereo_focal_px, cx=depth.shape[0]/2, cy=depth.shape[1]/2)
 
                 volume.integrate(rgbd, oin, pose)
 
