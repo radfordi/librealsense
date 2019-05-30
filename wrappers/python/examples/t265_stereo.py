@@ -39,6 +39,8 @@ import cv2
 import numpy as np
 from math import tan, pi
 
+import open3d as o3d
+
 """
 In this section, we will set up the functions that will translate the camera
 intrinsics and extrinsics from librealsense into parameters that can be used
@@ -74,12 +76,31 @@ Returns the fisheye distortion from librealsense intrinsics
 def fisheye_distortion(intrinsics):
     return np.array(intrinsics.coeffs[:4])
 
+def pose_to_matrix(Q,T):
+    (x, y, z, w) = (Q.x, Q.y, Q.z, Q.w)
+    G = np.zeros([4,4])
+    G[0][0] = 1 - 2 * (y*y + z*z)
+    G[0][1] = 2 * (x*y - w*z)
+    G[0][2] = 2 * (x*z + w*y)
+    G[1][0] = 2 * (x*y + w*z)
+    G[1][1] = 1 - 2 * (x*x + z*z)
+    G[1][2] = 2 * (y*z - w*x)
+    G[2][0] = 2 * (x*z - w*y)
+    G[2][1] = 2 * (y*z + w*x)
+    G[2][2] = 1 - 2 * (x*x + y*y)
+    G[0][3] = T.x
+    G[1][3] = T.y
+    G[2][3] = T.z
+    G[3][3] = 1
+    return G
+
 # Set up a mutex to share data between threads 
 from threading import Lock
 frame_mutex = Lock()
 frame_data = {"left"  : None,
               "right" : None,
-              "timestamp_ms" : None
+              "timestamp_ms" : None,
+              "pose": None,
               }
 
 """
@@ -90,6 +111,12 @@ callback queue.
 """
 def callback(frame):
     global frame_data
+    if frame.is_pose_frame():
+        pose = frame.as_pose_frame()
+        RT = pose_to_matrix(pose.pose_data.rotation, pose.pose_data.translation)
+        frame_mutex.acquire()
+        frame_data["pose"] = RT
+        frame_mutex.release()
     if frame.is_frameset():
         frameset = frame.as_frameset()
         f1 = frameset.get_fisheye_frame(1).as_video_frame()
@@ -212,11 +239,14 @@ try:
     undistort_rectify = {"left"  : (lm1, lm2),
                          "right" : (rm1, rm2)}
 
+    volume = o3d.integration.ScalableTSDFVolume(voxel_length=4.0 / 512.0, sdf_trunc=0.04, color_type=o3d.integration.TSDFVolumeColorType.Gray32) # FIXME: Get Gray32 to work
+
     mode = "stack"
     while True:
         # Check if the camera has acquired any frames
         frame_mutex.acquire()
         valid = frame_data["timestamp_ms"] is not None
+        pose = frame_data["pose"]
         frame_mutex.release()
 
         # If frames are ready to process
@@ -246,7 +276,21 @@ try:
             # convert disparity to 0-255 and color it
             disp_vis = 255*(disparity - min_disp)/ num_disp
             disp_color = cv2.applyColorMap(cv2.convertScaleAbs(disp_vis,1), cv2.COLORMAP_JET)
-            color_image = cv2.cvtColor(center_undistorted["left"][:,max_disp:], cv2.COLOR_GRAY2RGB)
+            gray = center_undistorted["left"][:,max_disp:]
+            color_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
+            if pose is not None:
+                depth = (disparity * np.linalg.norm(T) * 1000 / stereo_focal_px).astype(np.uint16)
+
+                rgbd = o3d.geometry.create_rgbd_image_from_color_and_depth(o3d.geometry.Image(color_image),#o3d.geometry.Image((gray*(2**31-1)).astype(np.uint32)),
+                                                                           o3d.geometry.Image(depth),
+                                                                           depth_trunc=4.0, convert_rgb_to_intensity=True)
+
+                assert(depth.shape == gray.shape)
+
+                oin = o3d.camera.PinholeCameraIntrinsic(depth.shape[0],depth.shape[1],stereo_focal_px,stereo_focal_px,depth.shape[0]/2,depth.shape[1]/2)
+
+                volume.integrate(rgbd, oin, pose)
 
             if mode == "stack":
                 cv2.imshow(WINDOW_TITLE, np.hstack((color_image, disp_color)))
@@ -263,3 +307,9 @@ try:
             break
 finally:
     pipe.stop()
+
+
+print("Extract a triangle mesh from the volume and visualize it.")
+mesh = volume.extract_triangle_mesh()
+mesh.compute_vertex_normals()
+o3d.visualization.draw_geometries([mesh])
